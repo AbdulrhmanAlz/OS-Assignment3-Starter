@@ -5,6 +5,8 @@ import java.util.HashMap;
 import java.util.Random;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.Semaphore;
 
 // ANSI Color Codes for enhanced terminal output
 class Colors {
@@ -25,47 +27,67 @@ class Colors {
     public static final String BRIGHT_GREEN = "\u001B[92m";
 }
 
-// ⚠️ SHARED RESOURCES - These need synchronization! ⚠️
+// SHARED RESOURCES - NOW WITH FULL SYNCHRONIZATION!
 class SharedResources {
-    // TODO: Students will add synchronization mechanisms here
-    // HINT: Use ReentrantLock for mutual exclusion
-    // HINT: Use Semaphore for limiting concurrent access
     
-    public static int contextSwitchCount = 0;      // Shared counter - NEEDS PROTECTION!
-    public static int completedProcessCount = 0;   // Shared counter - NEEDS PROTECTION!
-    public static long totalWaitingTime = 0;       // Shared accumulator - NEEDS PROTECTION!
-    public static List<String> executionLog = new ArrayList<>();  // Shared list - NEEDS PROTECTION!
+    // ===== ReentrantLocks for counters (Fine-grained locking) =====
+    // Using separate locks for each counter for maximum concurrency
+    public static final ReentrantLock contextSwitchLock = new ReentrantLock();
+    public static final ReentrantLock completedProcessLock = new ReentrantLock();
+    public static final ReentrantLock waitingTimeLock = new ReentrantLock();
     
-    // TODO #1: Add a ReentrantLock(s) here to protect critical sections
-    // Example: public static final ReentrantLock lock = new ReentrantLock();
+    // ===== ReentrantLock for execution log =====
+    public static final ReentrantLock logLock = new ReentrantLock();
     
-    // TODO #2: Add a Semaphore to limit concurrent process execution
-    // Example: public static final Semaphore cpuSemaphore = new Semaphore(1);
+    // ===== Semaphore for CPU access (Binary semaphore = 1 permit) =====
+    public static final Semaphore cpuSemaphore = new Semaphore(1);
     
-    // Method to increment context switch counter
+    // Shared resources (protected by locks above)
+    public static int contextSwitchCount = 0;
+    public static int completedProcessCount = 0;
+    public static long totalWaitingTime = 0;
+    public static List<String> executionLog = new ArrayList<>();
+    
+    // Protected increment for context switch counter
     public static void incrementContextSwitch() {
-        // TODO: Protect this critical section with a lock
-        // RACE CONDITION: Multiple threads might read and write simultaneously!
-        contextSwitchCount++;
+        contextSwitchLock.lock();
+        try {
+            contextSwitchCount++;
+        } finally {
+            contextSwitchLock.unlock();
+        }
     }
     
-    // Method to increment completed process counter
+    // Protected increment for completed process counter
     public static void incrementCompletedProcess() {
-        // TODO: Protect this critical section with a lock
-        completedProcessCount++;
+        completedProcessLock.lock();
+        try {
+            completedProcessCount++;
+        } finally {
+            completedProcessLock.unlock();
+        }
     }
     
-    // Method to add waiting time
+    // Protected addition to total waiting time
     public static void addWaitingTime(long time) {
-        // TODO: Protect this critical section with a lock
-        totalWaitingTime += time;
+        waitingTimeLock.lock();
+        try {
+            totalWaitingTime += time;
+        } finally {
+            waitingTimeLock.unlock();
+        }
     }
     
-    // Method to log execution
+    // Protected log execution (prevents ConcurrentModificationException)
     public static void logExecution(String message) {
-        // TODO: Protect this critical section with a lock
-        // RACE CONDITION: ArrayList is not thread-safe!
-        executionLog.add(message);
+        logLock.lock();
+        try {
+            executionLog.add(message);
+        } catch (Exception e) {
+            System.out.println("Log error: " + e.getMessage());
+        } finally {
+            logLock.unlock();
+        }
     }
 }
 
@@ -78,7 +100,7 @@ class Process implements Runnable {
     private long creationTime;
     private long startTime;
     private long completionTime;
-    private int priority;  // From Assignment 1
+    private int priority;
     
     public Process(String name, int burstTime, int timeQuantum, int priority) {
         this.name = name;
@@ -92,71 +114,81 @@ class Process implements Runnable {
     
     @Override
     public void run() {
-        // TODO #3: Acquire CPU semaphore before executing
-        // This ensures only allowed number of processes run simultaneously
-        
+        // Acquire CPU semaphore before executing
+        // This ensures only ONE process runs at a time (binary semaphore)
         try {
-            if (startTime == -1) {
-                startTime = System.currentTimeMillis();
-            }
-            
-            // Increment context switch counter
-            SharedResources.incrementContextSwitch();
-            
-            int runTime = Math.min(timeQuantum, remainingTime);
-            
-            String quantumBar = createProgressBar(0, 15);
-            String message = "  ▶ " + name + " (Priority: " + priority + ") executing quantum [" + runTime + "ms]";
-            System.out.println(Colors.BRIGHT_GREEN + message + Colors.RESET);
-            
-            // Log execution
-            SharedResources.logExecution(name + " started quantum execution");
+            SharedResources.cpuSemaphore.acquire();
+            SharedResources.logExecution(name + " acquired CPU");
             
             try {
-                int steps = 5;
-                int stepTime = runTime / steps;
+                if (startTime == -1) {
+                    startTime = System.currentTimeMillis();
+                }
                 
-                for (int i = 1; i <= steps; i++) {
-                    Thread.sleep(stepTime);
-                    int quantumProgress = (i * 100) / steps;
-                    quantumBar = createProgressBar(quantumProgress, 15);
-                    System.out.print("\r  " + Colors.YELLOW + "⚡" + Colors.RESET + 
-                                    " Quantum progress: " + quantumBar);
+                // Increment context switch counter (protected by ReentrantLock)
+                SharedResources.incrementContextSwitch();
+                
+                int runTime = Math.min(timeQuantum, remainingTime);
+                
+                String message = "  ▶ " + name + " (Priority: " + priority + ") executing quantum [" + runTime + "ms]";
+                System.out.println(Colors.BRIGHT_GREEN + message + Colors.RESET);
+                
+                // Log execution (protected by ReentrantLock)
+                SharedResources.logExecution(name + " started quantum execution");
+                
+                try {
+                    int steps = 5;
+                    int stepTime = runTime / steps;
+                    
+                    for (int i = 1; i <= steps; i++) {
+                        Thread.sleep(stepTime);
+                        int quantumProgress = (i * 100) / steps;
+                        String quantumBar = createProgressBar(quantumProgress, 15);
+                        System.out.print("\r  " + Colors.YELLOW + "⚡" + Colors.RESET + 
+                                        " Quantum progress: " + quantumBar);
+                    }
+                    System.out.println();
+                    
+                } catch (InterruptedException e) {
+                    System.out.println(Colors.RED + "\n  ✗ " + name + " was interrupted." + Colors.RESET);
+                }
+                
+                remainingTime -= runTime;
+                int overallProgress = (int) (((double)(burstTime - remainingTime) / burstTime) * 100);
+                String overallProgressBar = createProgressBar(overallProgress, 20);
+                
+                System.out.println(Colors.YELLOW + "  ⏸ " + Colors.CYAN + name + Colors.RESET + 
+                                  " completed quantum " + Colors.BRIGHT_YELLOW + runTime + "ms" + Colors.RESET + 
+                                  " │ Overall progress: " + overallProgressBar);
+                System.out.println(Colors.MAGENTA + "     Remaining time: " + remainingTime + "ms" + Colors.RESET);
+                
+                if (remainingTime > 0) {
+                    System.out.println(Colors.BLUE + "  ↻ " + Colors.CYAN + name + Colors.RESET + 
+                                      " yields CPU for context switch" + Colors.RESET);
+                    SharedResources.logExecution(name + " yielded CPU");
+                } else {
+                    completionTime = System.currentTimeMillis();
+                    long waitingTime = (completionTime - creationTime) - burstTime;
+                    SharedResources.addWaitingTime(waitingTime);
+                    SharedResources.incrementCompletedProcess();
+                    SharedResources.logExecution(name + " completed execution");
+                    System.out.println(Colors.BRIGHT_GREEN + "  ✓ " + Colors.BOLD + Colors.CYAN + name + 
+                                      Colors.RESET + Colors.BRIGHT_GREEN + " finished execution!" + 
+                                      Colors.RESET);
                 }
                 System.out.println();
                 
-            } catch (InterruptedException e) {
-                System.out.println(Colors.RED + "\n  ✗ " + name + " was interrupted." + Colors.RESET);
+            } catch (Exception e) {
+                SharedResources.logExecution(name + " error: " + e.getMessage());
             }
             
-            remainingTime -= runTime;
-            int overallProgress = (int) (((double)(burstTime - remainingTime) / burstTime) * 100);
-            String overallProgressBar = createProgressBar(overallProgress, 20);
-            
-            System.out.println(Colors.YELLOW + "  ⏸ " + Colors.CYAN + name + Colors.RESET + 
-                              " completed quantum " + Colors.BRIGHT_YELLOW + runTime + "ms" + Colors.RESET + 
-                              " │ Overall progress: " + overallProgressBar);
-            System.out.println(Colors.MAGENTA + "     Remaining time: " + remainingTime + "ms" + Colors.RESET);
-            
-            if (remainingTime > 0) {
-                System.out.println(Colors.BLUE + "  ↻ " + Colors.CYAN + name + Colors.RESET + 
-                                  " yields CPU for context switch" + Colors.RESET);
-                SharedResources.logExecution(name + " yielded CPU");
-            } else {
-                completionTime = System.currentTimeMillis();
-                long waitingTime = (completionTime - creationTime) - burstTime;
-                SharedResources.addWaitingTime(waitingTime);
-                SharedResources.incrementCompletedProcess();
-                SharedResources.logExecution(name + " completed execution");
-                System.out.println(Colors.BRIGHT_GREEN + "  ✓ " + Colors.BOLD + Colors.CYAN + name + 
-                                  Colors.RESET + Colors.BRIGHT_GREEN + " finished execution!" + 
-                                  Colors.RESET);
-            }
-            System.out.println();
-            
+        } catch (InterruptedException e) {
+            System.out.println(Colors.RED + "  ✗ " + name + " interrupted while waiting for CPU." + Colors.RESET);
+            Thread.currentThread().interrupt();
         } finally {
-            // TODO #4: Release CPU semaphore here
-            // Always release in finally block to prevent deadlocks!
+            // ALWAYS release CPU semaphore in finally block to prevent deadlocks!
+            SharedResources.cpuSemaphore.release();
+            SharedResources.logExecution(name + " released CPU");
         }
     }
     
@@ -174,25 +206,36 @@ class Process implements Runnable {
         return bar.toString();
     }
     
+    // runToCompletion with semaphore protection!
     public void runToCompletion() {
-        // TODO: Similar synchronization needed here
         try {
-            System.out.println(Colors.BRIGHT_CYAN + "  ⚡ " + Colors.BOLD + Colors.CYAN + name + 
-                              Colors.RESET + Colors.BRIGHT_CYAN + " is the last process, running to completion" + 
-                              Colors.RESET + " [" + remainingTime + "ms]");
-            Thread.sleep(remainingTime);
-            remainingTime = 0;
-            completionTime = System.currentTimeMillis();
+            SharedResources.cpuSemaphore.acquire();
+            SharedResources.logExecution(name + " (last process) acquired CPU");
             
-            long waitingTime = (completionTime - creationTime) - burstTime;
-            SharedResources.addWaitingTime(waitingTime);
-            SharedResources.incrementCompletedProcess();
-            
-            System.out.println(Colors.BRIGHT_GREEN + "  ✓ " + Colors.BOLD + Colors.CYAN + name + 
-                              Colors.RESET + Colors.BRIGHT_GREEN + " finished execution!" + Colors.RESET);
-            System.out.println();
+            try {
+                System.out.println(Colors.BRIGHT_CYAN + "  ⚡ " + Colors.BOLD + Colors.CYAN + name + 
+                                  Colors.RESET + Colors.BRIGHT_CYAN + " is the last process, running to completion" + 
+                                  Colors.RESET + " [" + remainingTime + "ms]");
+                Thread.sleep(remainingTime);
+                remainingTime = 0;
+                completionTime = System.currentTimeMillis();
+                
+                long waitingTime = (completionTime - creationTime) - burstTime;
+                SharedResources.addWaitingTime(waitingTime);
+                SharedResources.incrementCompletedProcess();
+                
+                System.out.println(Colors.BRIGHT_GREEN + "  ✓ " + Colors.BOLD + Colors.CYAN + name + 
+                                  Colors.RESET + Colors.BRIGHT_GREEN + " finished execution!" + Colors.RESET);
+                System.out.println();
+            } catch (InterruptedException e) {
+                System.out.println(Colors.RED + "  ✗ " + name + " was interrupted." + Colors.RESET);
+            } finally {
+                SharedResources.cpuSemaphore.release();
+                SharedResources.logExecution(name + " (last process) released CPU");
+            }
         } catch (InterruptedException e) {
-            System.out.println(Colors.RED + "  ✗ " + name + " was interrupted." + Colors.RESET);
+            System.out.println(Colors.RED + "  ✗ " + name + " interrupted while waiting for CPU." + Colors.RESET);
+            Thread.currentThread().interrupt();
         }
     }
     
@@ -226,8 +269,8 @@ class Process implements Runnable {
 
 public class SchedulerSimulationSync {
     public static void main(String[] args) {
-        // ⚠️ IMPORTANT: Put your student ID here
-        int studentID = 123456789;  // ← CHANGE THIS TO YOUR ACTUAL STUDENT ID
+        // STUDENT ID - CHANGE THIS TO YOUR ACTUAL STUDENT ID
+        int studentID = 443050343;  // Abdulrahman's student ID
         
         Random random = new Random(studentID);
         
@@ -263,7 +306,7 @@ public class SchedulerSimulationSync {
                           Colors.BOLD + Colors.BRIGHT_CYAN + "║" + Colors.RESET);
         System.out.println(Colors.BOLD + Colors.BRIGHT_CYAN + "║" + Colors.RESET + 
                           Colors.YELLOW + "  🔒 Sync Mode:     " + Colors.RESET + Colors.BRIGHT_YELLOW + 
-                          String.format("%-65s", "Mutex Locks & Semaphores") + 
+                          String.format("%-65s", "ReentrantLock (4 locks) + Semaphore(1)") + 
                           Colors.BOLD + Colors.BRIGHT_CYAN + "║" + Colors.RESET);
         System.out.println(Colors.BOLD + Colors.BRIGHT_CYAN + 
                           "╚═══════════════════════════════════════════════════════════════════════════════════════╝" + 
@@ -272,7 +315,7 @@ public class SchedulerSimulationSync {
         // Create processes with priorities
         for (int i = 1; i <= numProcesses; i++) {
             int burstTime = timeQuantum/2 + random.nextInt(2 * timeQuantum + 1);
-            int priority = 1 + random.nextInt(5);  // Priority between 1 and 5
+            int priority = 1 + random.nextInt(5);
             
             Process process = new Process("P" + i, burstTime, timeQuantum, priority);
             allProcesses.add(process);
@@ -348,6 +391,7 @@ public class SchedulerSimulationSync {
                           " added to ready queue" + Colors.RESET + 
                           " │ Burst time: " + Colors.YELLOW + process.getBurstTime() + "ms" + 
                           Colors.RESET);
+        SharedResources.logExecution(process.getName() + " added to ready queue");
     }
     
     public static void printStatistics(List<Process> processes, int timeQuantum) {
@@ -390,6 +434,17 @@ public class SchedulerSimulationSync {
         System.out.println(Colors.BOLD + Colors.BRIGHT_CYAN + "═══ Execution Log Summary ═══" + Colors.RESET);
         System.out.println(Colors.YELLOW + "Total log entries: " + Colors.BRIGHT_YELLOW + 
                           SharedResources.executionLog.size() + Colors.RESET);
+        System.out.println();
+        
+        // Show synchronization mechanisms used
+        System.out.println(Colors.BOLD + Colors.BRIGHT_CYAN + "═══ Synchronization Mechanisms Used ═══" + Colors.RESET);
+        System.out.println(Colors.GREEN + "✓ " + Colors.RESET + "ReentrantLock (4 separate locks):" + Colors.RESET);
+        System.out.println("    - contextSwitchLock (fine-grained)");
+        System.out.println("    - completedProcessLock (fine-grained)");
+        System.out.println("    - waitingTimeLock (fine-grained)");
+        System.out.println("    - logLock (dedicated for ArrayList)");
+        System.out.println(Colors.GREEN + "✓ " + Colors.RESET + "Semaphore: binary semaphore (1 permit) for CPU access");
+        System.out.println(Colors.GREEN + "✓ " + Colors.RESET + "All locks use try-finally blocks to prevent deadlocks");
         System.out.println();
     }
 }
